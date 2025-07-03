@@ -1,122 +1,134 @@
 import os
 import logging
 import random
-from datetime import datetime
 import pandas as pd
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, executor
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InputFile
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# Настройки
-API_TOKEN = os.getenv('TELEGRAM_TOKEN') or "ВАШ_ТОКЕН_БОТА"  # ← Замените!
+# Конфигурация
+API_TOKEN = os.getenv('TELEGRAM_TOKEN')
+ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')  # Ваш ID для уведомлений
+EXCEL_FILE = "users_data.xlsx"
+BACKUP_FOLDER = "backups"
+BACKUP_DAYS = 30  # Хранить бэкапы N дней
+
+# Инициализация
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
+scheduler = AsyncIOScheduler()
 
-# Файл для данных
-EXCEL_FILE = "users_data.xlsx"
+# Создаем папки
+os.makedirs(BACKUP_FOLDER, exist_ok=True)
 
-# Загружаем существующие данные или создаем новую таблицу
+# --- ФУНКЦИИ ДЛЯ РАБОТЫ С ДАННЫМИ ---
 def init_excel():
+    """Создает файл Excel при первом запуске"""
     if not os.path.exists(EXCEL_FILE):
         df = pd.DataFrame(columns=[
-            'user_id', 'username', 'first_name', 'last_name', 
+            'user_id', 'username', 'first_name', 'last_name',
             'name', 'age', 'city', 'created_at'
         ])
         df.to_excel(EXCEL_FILE, index=False)
 
-# Сохраняем нового пользователя
-def save_to_excel(user_data: dict):
+async def notify_admin(user_data: dict):
+    """Уведомление о новом пользователе"""
     try:
-        df = pd.read_excel(EXCEL_FILE)
-        new_row = {
-            'user_id': user_data['user_id'],
-            'username': user_data['username'],
-            'first_name': user_data['first_name'],
-            'last_name': user_data['last_name'],
-            'name': user_data['name'],
-            'age': user_data['age'],
-            'city': user_data['city'],
-            'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        df.to_excel(EXCEL_FILE, index=False)
+        text = (
+            "🆕 Новый пользователь:\n"
+            f"👤 Имя: {user_data['name']}\n"
+            f"🏙️ Город: {user_data['city']}\n"
+            f"🔢 Возраст: {user_data['age']}\n"
+            f"🆔 ID: {user_data['user_id']}"
+        )
+        await bot.send_message(ADMIN_CHAT_ID, text)
     except Exception as e:
-        logging.error(f"Ошибка сохранения в Excel: {e}")
+        logging.error(f"Ошибка уведомления: {e}")
 
-# Инициализация при запуске
+def clean_backups():
+    """Удаление старых бэкапов"""
+    try:
+        now = datetime.now()
+        for filename in os.listdir(BACKUP_FOLDER):
+            filepath = os.path.join(BACKUP_FOLDER, filename)
+            if os.path.isfile(filepath):
+                file_date_str = filename.split('_')[-1].replace('.xlsx', '')
+                file_date = datetime.strptime(file_date_str, "%Y-%m-%d")
+                if (now - file_date).days > BACKUP_DAYS:
+                    os.remove(filepath)
+                    logging.info(f"Удален старый бэкап: {filename}")
+    except Exception as e:
+        logging.error(f"Ошибка очистки бэкапов: {e}")
+
+async def send_backup():
+    """Ежедневный бэкап с очисткой"""
+    try:
+        # Создаем бэкап
+        today = datetime.now().strftime("%Y-%m-%d")
+        backup_file = f"{BACKUP_FOLDER}/users_backup_{today}.xlsx"
+        df = pd.read_excel(EXCEL_FILE)
+        df.to_excel(backup_file, index=False)
+        
+        # Отправляем админу
+        await bot.send_document(
+            chat_id=ADMIN_CHAT_ID,
+            document=InputFile(backup_file),
+            caption=f"📊 Бэкап за {today} (всего пользователей: {len(df)})"
+        )
+        
+        # Чистим старые бэкапы
+        clean_backups()
+    except Exception as e:
+        logging.error(f"Ошибка бэкапа: {e}")
+
+# --- ОСНОВНОЙ КОД БОТА ---
 init_excel()
 
-# Остальной код остается как в предыдущей версии (клавиатуры, обработчики)
-user_data = {}
+# Планировщик задач
+scheduler.add_job(send_backup, 'cron', hour=0, minute=5)  # В 00:05
+scheduler.start()
 
-final_messages = [
-    "✨ Твоя энергия открыла доступ к денежному ресурсу...",
-    "🎉 Всё готово! Вот твоя ссылка: https://clicktvf.com/ELAb"
-]
+# ... (ваши обработчики сообщений из предыдущего кода)
 
-start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Начать путь 🔮"))
-repeat_keyboard = ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Хочешь еще?🔮"))
-
-@dp.message_handler(commands=['start', 'help'])
-@dp.message_handler(content_types=['text'])
-async def auto_start(message: types.Message):
+@dp.message_handler(lambda message: message.text == "Начать путь 🔮")
+async def start_questionnaire(message: types.Message):
     user_id = message.from_user.id
-    
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "step": "name",
-            "username": message.from_user.username,
-            "first_name": message.from_user.first_name,
-            "last_name": message.from_user.last_name
-        }
-        await message.answer("🔮 Как тебя зовут?", reply_markup=ReplyKeyboardMarkup(remove_keyboard=True))
-    else:
-        await continue_questionnaire(message)
-
-async def continue_questionnaire(message: types.Message):
-    user_id = message.from_user.id
-    data = user_data.get(user_id, {})
-    
-    if data.get("step") == "name":
-        user_data[user_id]["name"] = message.text
-        user_data[user_id]["step"] = "city"
-        await message.answer("Из какого ты города?")
-        
-    elif data.get("step") == "city":
-        user_data[user_id]["city"] = message.text
-        user_data[user_id]["step"] = "age"
-        await message.answer("Сколько тебе лет? (только цифры)")
-        
-    elif data.get("step") == "age":
-        if message.text.isdigit():
-            age = int(message.text)
-            if 12 <= age <= 100:
-                user_data[user_id]["age"] = age
-                user_data[user_id]["user_id"] = user_id
-                
-                # Сохраняем в Excel
-                save_to_excel(user_data[user_id])
-                
-                await message.answer(
-                    random.choice(final_messages),
-                    reply_markup=repeat_keyboard
-                )
-                user_data[user_id] = {"step": "name"}  # Сброс для повторного прохождения
-            else:
-                await message.answer("Введите возраст от 12 до 100 лет!")
-        else:
-            await message.answer("Пожалуйста, введите число!")
-
-@dp.message_handler(lambda message: message.text == "Хочешь еще?🔮")
-async def repeat_questionnaire(message: types.Message):
-    user_id = message.from_user.id
-    user_data[user_id] = {
-        "step": "name",
-        "username": message.from_user.username,
-        "first_name": message.from_user.first_name,
-        "last_name": message.from_user.last_name
-    }
+    user_data[user_id] = {"step": "name"}
     await message.answer("Как тебя зовут?", reply_markup=ReplyKeyboardMarkup(remove_keyboard=True))
+
+@dp.message_handler(state="age")
+async def process_age(message: types.Message, state: FSMContext):
+    if message.text.isdigit():
+        age = int(message.text)
+        if 12 <= age <= 100:
+            async with state.proxy() as data:
+                data['age'] = age
+                user_data = {
+                    'user_id': message.from_user.id,
+                    'username': message.from_user.username,
+                    'first_name': message.from_user.first_name,
+                    'last_name': message.from_user.last_name,
+                    'name': data['name'],
+                    'city': data['city'],
+                    'age': age
+                }
+                
+                if save_to_excel(user_data):
+                    await notify_admin(user_data)  # Уведомляем админа
+                    
+                    await message.answer(
+                        random.choice(final_messages),
+                        reply_markup=repeat_keyboard
+                    )
+                else:
+                    await message.answer("⚠️ Ошибка сохранения. Попробуйте позже.")
+            
+            await state.finish()
+            return
+    
+    await message.answer("Пожалуйста, введите реальный возраст (12-100):")
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
